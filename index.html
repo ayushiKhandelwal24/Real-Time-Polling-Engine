@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Polling Engine</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .poll-card { transition: all 0.3s ease; }
+        .vote-bar { transition: width 0.5s ease-in-out; height: 20px; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="container py-5" style="max-width: 700px;">
+        <div class="card shadow-sm p-4 mb-4 poll-card">
+            <h2 class="mb-4 fw-bold text-primary">Create a Live Poll</h2>
+            <div class="mb-3">
+                <label class="form-label fw-semibold">Poll Question / Title</label>
+                <input type="text" id="pollTitle" class="form-control" placeholder="What is your favorite language?">
+            </div>
+            <div class="mb-4">
+                <label class="form-label fw-semibold">Options</label>
+                <input type="text" class="form-control choice-input mb-2" placeholder="Option 1">
+                <input type="text" class="form-control choice-input mb-2" placeholder="Option 2">
+                <input type="text" class="form-control choice-input mb-2" placeholder="Option 3">
+            </div>
+            <button onclick="deployPoll()" class="btn btn-primary w-100 fw-semibold py-2">Deploy Poll</button>
+        </div>
+
+        <h3 class="fw-bold text-secondary mb-3">Active Live Polls</h3>
+        <div id="pollsContainer"></div>
+    </div>
+
+    <script>
+        const BACKEND_URL = "http://127.0.0.1:8000";
+        const fingerprint = "user_" + Math.random().toString(36).substring(2, 9);
+
+        // 1. Fetch Existing Polls on Page Load
+        async function loadPolls() {
+            try {
+                const res = await fetch(`${BACKEND_URL}/polls`);
+                const polls = await res.json();
+                const container = document.getElementById("pollsContainer");
+                container.innerHTML = "";
+
+                if (polls.length === 0) {
+                    container.innerHTML = `<p class="text-muted text-center">No active polls found. Create one above!</p>`;
+                    return;
+                }
+
+                polls.forEach(poll => {
+                    const totalVotes = poll.choices.reduce((sum, c) => sum + c.votes, 0);
+                    let choicesHtml = "";
+
+                    poll.choices.forEach(choice => {
+                        const pct = totalVotes > 0 ? Math.round((choice.votes / totalVotes) * 100) : 0;
+                        choicesHtml += `
+                            <div class="mb-3">
+                                <div class="d-flex justify-content-between align-items-center mb-1">
+                                    <span>${choice.text} <small class="text-muted">(${choice.votes} votes)</small></span>
+                                    <span class="fw-bold">${pct}%</span>
+                                </div>
+                                <div class="progress mb-2" style="height: 20px;">
+                                    <div class="progress-bar bg-success vote-bar" style="width: ${pct}%"></div>
+                                </div>
+                                <button class="btn btn-sm btn-outline-secondary" onclick="castVote(${poll.id}, ${choice.id})">Vote</button>
+                            </div>
+                        `;
+                    });
+
+                    container.innerHTML += `
+                        <div class="card shadow-sm p-4 mb-3 border-start border-primary border-4" id="poll-card-${poll.id}">
+                            <h4 class="fw-bold mb-3">${poll.title}</h4>
+                            <div>${choicesHtml}</div>
+                        </div>
+                    `;
+                });
+            } catch (err) {
+                console.error("Error loading polls:", err);
+            }
+        }
+
+        // 2. Deploy a New Poll to Backend
+        async function deployPoll() {
+            const titleInput = document.getElementById("pollTitle");
+            const choiceInputs = document.querySelectorAll(".choice-input");
+            
+            const title = titleInput.value.trim();
+            const choices = Array.from(choiceInputs).map(i => i.value.trim()).filter(v => v !== "");
+
+            if (!title) {
+                alert("Please enter a Poll Title/Question first!");
+                return;
+            }
+            if (choices.length < 2) {
+                alert("Please provide at least 2 options!");
+                return;
+            }
+
+            const response = await fetch(`${BACKEND_URL}/polls`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: title, choices: choices })
+            });
+
+            if (response.ok) {
+                titleInput.value = "";
+                choiceInputs.forEach(i => i.value = "");
+                loadPolls();
+            } else {
+                alert("Failed to deploy poll. Check server logs.");
+            }
+        }
+
+        // 3. Cast a Vote Function
+        async function castVote(pollId, choiceId) {
+            const response = await fetch(`${BACKEND_URL}/votes`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ poll_id: pollId, choice_id: choiceId, voter_fingerprint: fingerprint })
+            });
+
+            const data = await response.json();
+            if (response.ok) {
+                loadPolls();
+            } else {
+                alert(data.detail || "Error casting vote.");
+            }
+        }
+
+        // 4. WebSocket Real-Time Listener Connection
+        function connectWS() {
+            const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+            ws.onmessage = (event) => {
+                // Instantly refresh calculations on active view when someone votes
+                loadPolls();
+            };
+            ws.onclose = () => {
+                setTimeout(connectWS, 2000); // Auto-reconnect safety
+            };
+        }
+
+        // Run functions immediately on page startup
+        loadPolls();
+        connectWS();
+    </script>
+</body>
+</html>
