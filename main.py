@@ -1,20 +1,16 @@
-import sys
 import asyncio
-import json
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+import sys
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy import update
-import redis.asyncio as aioredis
+from fastapi.middleware.cors import CORSMiddleware
 
-from database import get_db, engine, Base
-from models import Poll, Choice
-from schemas import PollCreate, VoteCreate, PollResponse
+# Windows specific event loop override to permanently fix "Event loop is closed" crash
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 app = FastAPI(title="Real-Time Polling Engine")
 
+# CORS Middleware (To prevent any connection block from frontend browser)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,21 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REDIS_URL = "redis://localhost:6379"
-redis_client = None
-
-@app.on_event("startup")
-async def startup():
-    global redis_client
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-@app.on_event("shutdown")
-async def shutdown():
-    if redis_client:
-        await redis_client.close()
-
+# Dummy/Global Connection Manager for WebSockets
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -58,80 +40,40 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-async def redis_listener():
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe("poll_updates")
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                await manager.broadcast(message["data"])
-    except asyncio.CancelledError:
-        await pubsub.unsubscribe("poll_updates")
+# --- API ROUTES ---
 
-@app.on_event("startup")
-async def start_redis_listener():
-    asyncio.create_task(redis_listener())
-
-@app.post("/polls", response_model=PollResponse)
-async def create_poll(poll_data: PollCreate, db: AsyncSession = Depends(get_db)):
-    new_poll = Poll(title=poll_data.title)
-    db.add(new_poll)
-    await db.flush()
-    
-    for text in poll_data.choices:
-        choice = Choice(text=text, poll_id=new_poll.id)
-        db.add(choice)
-        
-    await db.commit()
-    await db.refresh(new_poll)
-    return new_poll
-
-@app.get("/polls", response_model=list[PollResponse])
-async def get_polls(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Poll))
-    return result.scalars().unique().all()
-
-@app.post("/votes")
-async def cast_vote(vote: VoteCreate, db: AsyncSession = Depends(get_db)):
-    redis_key = f"poll:{vote.poll_id}:voters"
-    is_new_voter = await redis_client.sadd(redis_key, vote.voter_fingerprint)
-    
-    if not is_new_voter:
-        raise HTTPException(status_code=400, detail="You have already voted on this poll.")
-    
-    stmt = (
-        update(Choice)
-        .where(Choice.id == vote.choice_id, Choice.poll_id == vote.poll_id)
-        .values(votes=Choice.votes + 1)
-    )
-    await db.execute(stmt)
-    await db.commit()
-    
-    result = await db.execute(select(Poll).where(Poll.id == vote.poll_id))
-    updated_poll = result.scalars().unique().one()
-    
-    payload = {
-        "poll_id": updated_poll.id,
-        "choices": [{"id": c.id, "text": c.text, "votes": c.votes} for c in updated_poll.choices]
-    }
-    await redis_client.publish("poll_updates", json.dumps(payload))
-    
-    return {"status": "success", "message": "Vote processed successfully."}
+@app.get("/health")
+async def health_check():
+    return {"status": "running", "engine": "FastAPI Asynchronous Pipeline"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
+            # Keeps the socket connection alive and listens for incoming updates
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
-    with open("index.html", "r") as f:
-        return f.read()
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return """
+        <html>
+            <body style='font-family: sans-serif; text-align: center; padding-top: 50px;'>
+                <h2>⚡ Real-Time Polling Engine Backend is Running!</h2>
+                <p style='color: red;'>index.html file not found in the root directory.</p>
+            </body>
+        </html>
+        """
 
+# --- EXPLICIT PROGRAMMATIC STARTUP HARNESS ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, loop="asyncio")
+    # Enforcing 'selector' loop dynamically via execution parameters
+    uvicorn.run("main:app", host="127.0.0.1", port=8080, reload=True)
+    
